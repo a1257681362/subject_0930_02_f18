@@ -30,12 +30,15 @@ import java.util.Map;
 
 /**
  * 海区禁养规则维护与批次冻结/补偿。
- * 登记（requestId 幂等）：校验范围/时间/依据文件后落规则，随即扫描全部在途批次——
+ * 登记（requestId 幂等）：校验范围/时间/依据文件后落规则，随即在同一发布事务内扫描全部在途批次
+ *   生成冻结清单（随响应返回 freezeList，幂等回放同样返回）——
  *   空间命中的在途（STOCKED）批次逐批冻结，匹配记录与冻结账双向外键对应；
  *   空间命中但已完成（HARVESTED）的批次只写 COMPLETED_NOTICE 提示，绝不回写台账；
  *   单批冻结失败不影响其他批次（部分成功）：留 FAILED 匹配与独立事务失败证据，可补偿勾稽。
  * 撤销（requestId 幂等）：规则置 REVOKED，逐冻结账补偿——
  *   批次仍被其他生效重叠规则冻结的记 SKIPPED_STILL_BOUND（保持冻结），其余 RELEASED 解冻。
+ * 异常保留原始凭证：登记/撤销请求在业务处理中失败时，以独立事务写
+ *   CREATE_RULE_FAILED / REVOKE_RULE_FAILED 证据（含原始请求报文），主事务回滚后凭证仍可追溯。
  */
 @Service
 public class NoCultureRuleService {
@@ -73,9 +76,22 @@ public class NoCultureRuleService {
     /**
      * 登记禁养规则并扫描冻结在途批次。整单一个事务：规则与全部匹配/冻结账同成败，
      * 单批异常被捕获降级为 FAILED 匹配（独立证据），不影响其余批次——部分成功也账账对应。
+     * 业务处理失败时保留原始凭证（独立事务写 CREATE_RULE_FAILED 证据）后原样抛出。
      */
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> create(RuleCreateRequest request) {
+        try {
+            return doCreate(request);
+        } catch (Exception ex) {
+            preserveFailureVoucher(NoCultureChangeEvidence.ACTION_CREATE_RULE_FAILED, 0L,
+                    request == null ? null : request.getRequestId(),
+                    request == null ? null : request.getOperator(), request,
+                    "登记禁养规则" + (request == null ? "" : request.getRuleNo()) + "失败，原始凭证保留：" + ex.getMessage());
+            throw ex;
+        }
+    }
+
+    private Map<String, Object> doCreate(RuleCreateRequest request) {
         NoCultureRule existing = ruleMapper.selectOne(
                 new QueryWrapper<NoCultureRule>().eq("request_id", request.getRequestId()));
         if (existing != null) {
@@ -134,9 +150,22 @@ public class NoCultureRuleService {
 
     /**
      * 撤销规则并逐冻结账补偿解冻。重复撤销幂等：已撤销则直接回放既有补偿汇总，不多写。
+     * 业务处理失败时保留原始凭证（独立事务写 REVOKE_RULE_FAILED 证据）后原样抛出。
      */
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> revoke(Long ruleId, RuleRevokeRequest request) {
+        try {
+            return doRevoke(ruleId, request);
+        } catch (Exception ex) {
+            preserveFailureVoucher(NoCultureChangeEvidence.ACTION_REVOKE_RULE_FAILED, ruleId,
+                    request == null ? null : request.getRequestId(),
+                    request == null ? null : request.getOperator(), request,
+                    "撤销禁养规则id=" + ruleId + "失败，原始凭证保留：" + ex.getMessage());
+            throw ex;
+        }
+    }
+
+    private Map<String, Object> doRevoke(Long ruleId, RuleRevokeRequest request) {
         NoCultureRule rule = getOrThrow(ruleId);
         if (NoCultureRule.STATUS_REVOKED.equals(rule.getStatus())) {
             return revokeView(rule, compensationSummary(ruleId), true);
@@ -407,6 +436,20 @@ public class NoCultureRuleService {
         result.completedNotice++;
     }
 
+    /**
+     * 异常保留原始凭证：登记/撤销业务处理失败时，以独立事务把原始请求报文写入证据，
+     * 主事务回滚后失败事实与凭证仍可按 requestId 追溯。凭证写入自身失败不掩盖原异常。
+     */
+    private void preserveFailureVoucher(String action, Long entityId, String requestId,
+                                        String operator, Object originalRequest, String detail) {
+        try {
+            evidenceService.recordStandalone(NoCultureChangeEvidence.ENTITY_RULE, entityId,
+                    action, requestId, operator, null, originalRequest, detail);
+        } catch (Exception ignored) {
+            // 凭证保留失败不应掩盖主流程异常。
+        }
+    }
+
     /** 部分成功：单批冻结失败留 FAILED 匹配与独立事务证据，不随主事务回滚。 */
     private void insertFailedMatch(NoCultureRule rule, SeedlingBatch batch, Pond pond,
                                    String operator, String requestId, Exception ex,
@@ -503,10 +546,31 @@ public class NoCultureRuleService {
         view.put("completedNoticeCount", summary.completedNotice);
         view.put("failedCount", summary.failed);
         view.put("existedCount", summary.existed);
+        // 冻结清单：发布事务内生成的冻结账逐条列出（幂等回放同样返回），含批次号与命中说明
+        view.put("freezeList", loadFreezeList(rule.getId()));
         if (summary.detail != null) {
             view.put("detail", summary.detail);
         }
         return view;
+    }
+
+    /** 规则的冻结账清单：逐条带批次号、池塘与命中说明，状态含 FROZEN/RELEASED。 */
+    private List<Map<String, Object>> loadFreezeList(Long ruleId) {
+        List<NoCultureFreeze> freezes = freezeMapper.selectList(new QueryWrapper<NoCultureFreeze>()
+                .eq("rule_id", ruleId).orderByAsc("id"));
+        List<Map<String, Object>> list = new ArrayList<>();
+        for (NoCultureFreeze freeze : freezes) {
+            SeedlingBatch batch = batchMapper.selectById(freeze.getBatchId());
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("freezeId", freeze.getId());
+            row.put("batchId", freeze.getBatchId());
+            row.put("batchNo", batch == null ? null : batch.getBatchNo());
+            row.put("pondId", freeze.getPondId());
+            row.put("status", freeze.getStatus());
+            row.put("hitDetail", freeze.getHitDetail());
+            list.add(row);
+        }
+        return list;
     }
 
     private Map<String, Object> revokeView(NoCultureRule rule, ScanSummary summary, boolean idempotent) {

@@ -155,16 +155,16 @@
 
 模块包路径 `com.evops.aqua.noculture`，在台账之上打通：监管人员维护禁养范围/生效时间/依据文件 → 投苗、转池、捕捞三个入口空间与时间校验 → 规则新增即冻结在途批次（已完成记录只提示不回写）→ 空间重叠按更严格规则执行 → 撤销逐冻结账补偿解冻（仍被他规冻结的挂起），冻结/解冻/补偿全程留证且账账对应。
 
-- 禁养规则维护（`POST /api/aqua/noculture/rules`，requestId 强制幂等）：范围支持整海区 `AREA`（海区相等即命中）与经纬度多边形 `POLYGON`（池塘经纬度做点-多边形判定，至少 3 个顶点）；登记生效区间（半开 `[effectiveFrom, effectiveTo)`，`effectiveTo` 空表示长期有效）、依据文件文号/名称与严格级别；**规则只能新增与撤销，无删除接口**。重复 requestId 返回首条规则。
-- 规则新增即冻结在途批次：扫描全部批次，**空间命中的在途（STOCKED）批次逐批冻结**（`t_noculture_freeze`），投苗/转池/捕捞三入口一律拦截；**空间命中但已完成（HARVESTED）的批次只写提示（COMPLETED_NOTICE），绝不回写台账、不改批次状态**。
+- 禁养规则维护（`POST /api/aqua/noculture/rules`，requestId 强制幂等）：范围支持整海区 `AREA`（海区名归一化后相等即命中）与经纬度多边形 `POLYGON`（池塘经纬度做点-多边形判定，至少 3 个顶点；**边界相切按约定计入命中**——池塘中心点落在多边形任一边或顶点上即视为在禁养范围内，与边朝向无关）；登记生效区间（半开 `[effectiveFrom, effectiveTo)`，`effectiveTo` 空表示长期有效）、依据文件文号/名称与严格级别；**规则只能新增与撤销，无删除接口**。重复 requestId 返回首条规则。缺关键字段时一次性指出全部缺项，补齐后同 requestId 重试当前步骤即可（幂等不重复落单）。
+- 规则新增即冻结在途批次：**发布事务内生成冻结清单**（随响应返回 `freezeList`，幂等回放同样返回）——扫描全部批次，**空间命中的在途（STOCKED）批次逐批冻结**（`t_noculture_freeze`），投苗/转池/捕捞三入口一律拦截；**空间命中但已完成（HARVESTED）的批次只写提示（COMPLETED_NOTICE），绝不回写台账、不改批次状态**；未来生效的规则同样先生成冻结清单，拦截以操作日期是否落入生效区间为准。
 - 三入口空间 + 时间校验（`NoCultureGuard`）：投苗校验目标池、转池同时校验批次冻结态与目标池、捕捞校验批次冻结态与所在池；**必须空间命中且操作日期落入规则生效半开区间才拦截**——未来生效不提前拦、到期自动放行。
 - **空间边界重叠按更严格规则执行**：同一点可被多条规则命中并分别冻结，三入口按 `strictLevel` 最大者裁决，提示共命中规则数与最严规则依据文件。
 - 撤销与补偿（`POST /api/aqua/noculture/rules/{id}/revoke`，requestId 幂等）：规则置 REVOKED 并逐冻结账补偿——**批次仍被其他生效重叠规则冻结的补偿记 `SKIPPED_STILL_BOUND`（保持冻结），无其他约束的记 `RELEASED` 解冻放行**；重复撤销回放既有补偿、不多写。
 - **部分成功账账对应**：空间匹配记录（`t_noculture_match`）与冻结账双向外键对应；每条冻结至多一条撤销补偿（`t_noculture_compensation`，`uk freeze_id`），单批冻结失败降级为 FAILED 匹配并独立事务留证，不影响其他批次；`GET /api/aqua/noculture/rules/{id}/reconcile` 勾稽核对「禁养区域→空间匹配→冻结账→补偿」链路，出现悬挂即 `balanced=false`。
-- 全程留证：规则登记/撤销、每次冻结、解冻、挂起未解冻、已完成提示、冻结失败均写 `t_noculture_change_evidence`（含操作者、前后快照、幂等请求号），可经 `GET /api/aqua/noculture/evidence` 按对象或 requestId 追溯。
+- 全程留证：规则登记/撤销、每次冻结、解冻、挂起未解冻、已完成提示、冻结失败均写 `t_noculture_change_evidence`（含操作者、前后快照、幂等请求号），可经 `GET /api/aqua/noculture/evidence` 按对象或 requestId 追溯；**登记/撤销业务处理失败时保留原始凭证**——独立事务写 `CREATE_RULE_FAILED`/`REVOKE_RULE_FAILED` 证据（含原始请求报文），主事务回滚后仍可按 requestId 追溯。
 - 池塘档案补充中心点经纬度（`POST /api/aqua/ponds` 的 `longitude`/`latitude`，可空）；无坐标池塘只能被整海区规则命中，不会被多边形规则误伤。
 
-验收：`mvn test -Dtest=NoCultureAcceptanceTest`，11 个检查点逐段输出报告，失败即停并给出停点。
+验收：`mvn test -Dtest=NoCultureAcceptanceTest`，11 个检查点逐段输出报告，失败即停并给出停点；`mvn test -Dtest=NoCultureCrossDateOverlapAcceptanceTest` 覆盖边界相切计入、跨日期半开窗口转池单、未来生效规则冻结清单、多海区重叠冻结/撤销挂起、缺项指出与补齐重试、失败留原始凭证。
 
 ## 养殖设备保养工单（aqua-12）
 

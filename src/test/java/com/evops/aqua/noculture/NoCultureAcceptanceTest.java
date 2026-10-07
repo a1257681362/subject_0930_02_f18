@@ -132,7 +132,8 @@ class NoCultureAcceptanceTest {
                     "2000-01-01", null, 1, "监管钱海", "nc-bad-5");
             check(!json(call(HttpMethod.POST, "/api/aqua/noculture/rules", noArea))
                     .path("success").asBoolean(true), "整海区规则缺海区应被拒绝");
-            check(ruleMapper.selectCount(new QueryWrapper<NoCultureRule>()) == 0L,
+            check(ruleMapper.selectCount(new QueryWrapper<NoCultureRule>()
+                    .likeRight("rule_no", "NC-")) == 0L,
                     "全部非法请求都不得落规则");
         });
 
@@ -456,8 +457,10 @@ class NoCultureAcceptanceTest {
     }
 
     private long evidenceCount(String action, Long entityId) {
+        // 只统计本用例（nc- 前缀请求号）产生的证据，与增补用例（ncd-）执行顺序无关
         QueryWrapper<NoCultureChangeEvidence> wrapper = new QueryWrapper<NoCultureChangeEvidence>()
-                .eq("action", action);
+                .eq("action", action)
+                .likeRight("request_id", "nc-");
         if (entityId != null) {
             wrapper.eq("entity_id", entityId);
         }

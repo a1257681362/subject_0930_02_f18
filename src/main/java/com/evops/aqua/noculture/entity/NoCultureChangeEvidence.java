@@ -22,6 +22,8 @@ public class NoCultureChangeEvidence extends BaseEntity {
     public static final String ACTION_SKIP_UNFREEZE = "SKIP_UNFREEZE";
     public static final String ACTION_COMPLETED_NOTICE = "COMPLETED_NOTICE";
     public static final String ACTION_FREEZE_FAILED = "FREEZE_FAILED";
+    public static final String ACTION_CREATE_RULE_FAILED = "CREATE_RULE_FAILED";
+    public static final String ACTION_REVOKE_RULE_FAILED = "REVOKE_RULE_FAILED";
 
     private String entityType;
     private Long entityId;

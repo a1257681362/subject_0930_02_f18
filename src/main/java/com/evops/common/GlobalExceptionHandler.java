@@ -8,6 +8,9 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import java.util.ArrayList;
+import java.util.List;
+
 @RestControllerAdvice
 public class GlobalExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
@@ -15,11 +18,18 @@ public class GlobalExceptionHandler {
         return ApiResponse.fail(ex.getMessage());
     }
 
+    /**
+     * 参数校验失败：一次性列出全部缺项/不合法项（不只首条），
+     * 调用方按清单补齐后用原 requestId 重试当前步骤即可（幂等，不重复落单）。
+     */
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ApiResponse<Void> handleValidation(MethodArgumentNotValidException ex) {
-        FieldError fieldError = ex.getBindingResult().getFieldError();
-        String detail = fieldError == null ? "参数不合法" : fieldError.getDefaultMessage();
-        return ApiResponse.fail("参数校验失败：" + detail);
+        List<String> missing = new ArrayList<>();
+        for (FieldError fieldError : ex.getBindingResult().getFieldErrors()) {
+            missing.add(fieldError.getDefaultMessage());
+        }
+        String detail = missing.isEmpty() ? "参数不合法" : String.join("；", missing);
+        return ApiResponse.fail("参数校验失败，请补齐缺项：" + detail);
     }
 
     @ExceptionHandler(DuplicateKeyException.class)
