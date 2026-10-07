@@ -22,6 +22,8 @@ public class NoCultureChangeEvidence extends BaseEntity {
     public static final String ACTION_SKIP_UNFREEZE = "SKIP_UNFREEZE";
     public static final String ACTION_COMPLETED_NOTICE = "COMPLETED_NOTICE";
     public static final String ACTION_FREEZE_FAILED = "FREEZE_FAILED";
+    /** 空间边界判定异常：原始请求与异常必须作为原始凭证独立事务保留，不随主事务丢失。 */
+    public static final String ACTION_SPATIAL_FAILED = "SPATIAL_FAILED";
 
     private String entityType;
     private Long entityId;

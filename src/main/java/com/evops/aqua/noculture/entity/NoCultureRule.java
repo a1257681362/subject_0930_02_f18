@@ -33,6 +33,8 @@ public class NoCultureRule extends BaseEntity {
     private String basisDocName;
     private Integer strictLevel;
     private String status;
+    /** 规则发布时点：冻结清单以此为基准在发布事务内生成。 */
+    private LocalDateTime publishedTime;
     private String revokedBy;
     private LocalDateTime revokedTime;
     private String revokeReason;
@@ -60,6 +62,8 @@ public class NoCultureRule extends BaseEntity {
     public void setStrictLevel(Integer strictLevel) { this.strictLevel = strictLevel; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+    public LocalDateTime getPublishedTime() { return publishedTime; }
+    public void setPublishedTime(LocalDateTime publishedTime) { this.publishedTime = publishedTime; }
     public String getRevokedBy() { return revokedBy; }
     public void setRevokedBy(String revokedBy) { this.revokedBy = revokedBy; }
     public LocalDateTime getRevokedTime() { return revokedTime; }

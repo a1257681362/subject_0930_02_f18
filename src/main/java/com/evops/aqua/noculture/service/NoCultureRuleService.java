@@ -115,6 +115,7 @@ public class NoCultureRuleService {
         rule.setBasisDocName(request.getBasisDocName());
         rule.setStrictLevel(request.getStrictLevel() == null ? 1 : request.getStrictLevel());
         rule.setStatus(NoCultureRule.STATUS_ACTIVE);
+        rule.setPublishedTime(LocalDateTime.now());
         rule.setOperator(request.getOperator());
         rule.setRequestId(request.getRequestId());
         rule.setRemark(request.getRemark());
@@ -298,42 +299,63 @@ public class NoCultureRuleService {
     // ------------------------------------------------------------
 
     /**
-     * 扫描全部在途批次：空间命中则冻结（在途）或只提示（已完成）。
-     * 单批异常隔离为 FAILED 匹配 + 独立事务失败证据，不中断整单——部分成功。
+     * 扫描在途批次生成冻结清单（发布事务内）：
+     *   STOCKED 在途批显式按状态查询，空间命中即冻结；
+     *   HARVESTED 已完成批单独查询，命中只写 COMPLETED_NOTICE，绝不回写台账；
+     *   其余状态一律不进冻结清单（不能把未知状态当在途误冻）。
+     * 空间判定本身抛错时不再静默吞成"不命中"：留 SPATIAL_FAILED 匹配，
+     * 并以独立事务写失败证据（原始凭证），即便发布事务回滚凭证也在。
+     * 单批冻结异常隔离为 FAILED 匹配 + 独立事务证据，不中断整单——部分成功。
      */
     private ScanSummary scanAndFreeze(NoCultureRule rule, String operator, String requestId) {
         ScanSummary result = new ScanSummary();
-        LocalDate today = LocalDate.now();
-        boolean windowStillOpen = rule.getEffectiveTo() == null || rule.getEffectiveTo().isAfter(today);
+        LocalDate publishDate = rule.getPublishedTime() == null
+                ? LocalDate.now() : rule.getPublishedTime().toLocalDate();
+        boolean windowStillOpen = rule.getEffectiveTo() == null
+                || rule.getEffectiveTo().isAfter(publishDate);
         if (!windowStillOpen) {
-            result.detail = "规则生效区间已全部过去，不冻结当前批次";
+            result.detail = "规则生效区间在发布日" + publishDate + "已全部过去，不冻结当前批次";
             return result;
         }
 
-        List<SeedlingBatch> batches = batchMapper.selectList(
-                new QueryWrapper<SeedlingBatch>().orderByAsc("id"));
-        for (SeedlingBatch batch : batches) {
-            Pond pond = pondMapper.selectById(batch.getPondId());
-            boolean hit;
-            try {
-                hit = spatialMatcher.hits(rule, pond);
-            } catch (Exception ex) {
-                hit = false;
-            }
-            if (!hit) {
-                continue;
-            }
-            try {
-                if (SeedlingBatch.STATUS_HARVESTED.equals(batch.getStatus())) {
-                    insertCompletedNotice(rule, batch, pond, operator, requestId, result);
-                } else {
-                    insertFreeze(rule, batch, pond, operator, requestId, result);
-                }
-            } catch (Exception ex) {
-                insertFailedMatch(rule, batch, pond, operator, requestId, ex, result);
-            }
+        // 批次查询条件显式化：在途、已完成分别取，冻结清单只允许由 STOCKED 命中构成。
+        List<SeedlingBatch> stocked = batchMapper.selectList(new QueryWrapper<SeedlingBatch>()
+                .eq("status", SeedlingBatch.STATUS_STOCKED).orderByAsc("id"));
+        List<SeedlingBatch> harvested = batchMapper.selectList(new QueryWrapper<SeedlingBatch>()
+                .eq("status", SeedlingBatch.STATUS_HARVESTED).orderByAsc("id"));
+
+        for (SeedlingBatch batch : stocked) {
+            scanOne(rule, batch, operator, requestId, result, false);
+        }
+        for (SeedlingBatch batch : harvested) {
+            scanOne(rule, batch, operator, requestId, result, true);
         }
         return result;
+    }
+
+    private void scanOne(NoCultureRule rule, SeedlingBatch batch, String operator,
+                         String requestId, ScanSummary result, boolean harvested) {
+        Pond pond = pondMapper.selectById(batch.getPondId());
+        boolean hit;
+        try {
+            hit = spatialMatcher.hits(rule, pond);
+        } catch (Exception ex) {
+            // 空间判定异常绝不允许静默漏冻：失败匹配 + 独立事务原始凭证，等待人工/补偿核实。
+            insertSpatialFailure(rule, batch, pond, operator, requestId, ex, result);
+            return;
+        }
+        if (!hit) {
+            return;
+        }
+        try {
+            if (harvested) {
+                insertCompletedNotice(rule, batch, pond, operator, requestId, result);
+            } else {
+                insertFreeze(rule, batch, pond, operator, requestId, result);
+            }
+        } catch (Exception ex) {
+            insertFailedMatch(rule, batch, pond, operator, requestId, ex, result);
+        }
     }
 
     private void insertFreeze(NoCultureRule rule, SeedlingBatch batch, Pond pond,
@@ -418,16 +440,53 @@ public class NoCultureRuleService {
             match.setPondId(pond == null ? batch.getPondId() : pond.getId());
             match.setResult(NoCultureMatch.RESULT_FAILED);
             match.setSpatialHit(true);
-            match.setDetail("冻结失败：" + ex.getMessage());
+            match.setDetail("冻结失败：" + ex.getClass().getSimpleName() + "：" + ex.getMessage());
             match.setRequestId(requestId + "#E" + batch.getId());
             matchMapper.insert(match);
             evidenceService.recordStandalone(NoCultureChangeEvidence.ENTITY_MATCH, match.getId(),
                     NoCultureChangeEvidence.ACTION_FREEZE_FAILED, match.getRequestId(),
-                    operator, null, match, "批次id=" + batch.getId() + "冻结失败，部分成功：" + ex.getMessage());
+                    operator, null, match, "批次id=" + batch.getId() + "冻结失败，部分成功："
+                            + ex.getClass().getName() + "：" + ex.getMessage());
         } catch (Exception ignored) {
             // 独立证据也失败时不应掩盖主流程；勾稽核对会暴露缺口。
         }
         result.failed++;
+    }
+
+    /**
+     * 空间边界判定异常：绝不能静默当"不命中"放跑在途批。
+     * 留 SPATIAL_FAILED 匹配，并以独立事务把规则、批次、池塘快照与异常类型/信息作为
+     * 原始凭证保存（主事务回滚也不丢），等待人工核实边界后补冻。
+     */
+    private void insertSpatialFailure(NoCultureRule rule, SeedlingBatch batch, Pond pond,
+                                      String operator, String requestId, Exception ex,
+                                      ScanSummary result) {
+        String detail = "空间边界判定异常，批次id=" + batch.getId() + "（" + batch.getBatchNo()
+                + "，池id=" + batch.getPondId() + "）未能确认是否命中规则" + rule.getRuleNo()
+                + "，按疑点批次挂起待人工核实补冻：" + ex.getClass().getName() + "：" + ex.getMessage();
+        try {
+            NoCultureMatch match = new NoCultureMatch();
+            match.setRuleId(rule.getId());
+            match.setBatchId(batch.getId());
+            match.setPondId(pond == null ? batch.getPondId() : pond.getId());
+            match.setResult(NoCultureMatch.RESULT_SPATIAL_FAILED);
+            match.setSpatialHit(false);
+            match.setDetail(detail);
+            match.setRequestId(requestId + "#S" + batch.getId());
+            matchMapper.insert(match);
+            Map<String, Object> voucher = new LinkedHashMap<>();
+            voucher.put("rule", rule);
+            voucher.put("batch", batch);
+            voucher.put("pond", pond);
+            voucher.put("errorType", ex.getClass().getName());
+            voucher.put("errorMessage", ex.getMessage());
+            evidenceService.recordStandalone(NoCultureChangeEvidence.ENTITY_MATCH, match.getId(),
+                    NoCultureChangeEvidence.ACTION_SPATIAL_FAILED, match.getRequestId(),
+                    operator, null, voucher, detail);
+        } catch (Exception ignored) {
+            // 凭证落库再失败不应掩盖主流程；需人工介入核对扫描缺口。
+        }
+        result.spatialFailed++;
     }
 
     /** 其他仍 ACTIVE 且对该批保留 FROZEN 账的规则（空间重叠命中过）。 */
@@ -502,6 +561,7 @@ public class NoCultureRuleService {
         view.put("frozenCount", summary.frozen);
         view.put("completedNoticeCount", summary.completedNotice);
         view.put("failedCount", summary.failed);
+        view.put("spatialFailedCount", summary.spatialFailed);
         view.put("existedCount", summary.existed);
         if (summary.detail != null) {
             view.put("detail", summary.detail);
@@ -523,6 +583,7 @@ public class NoCultureRuleService {
         summary.frozen = count(ruleId, NoCultureMatch.RESULT_FROZEN);
         summary.completedNotice = count(ruleId, NoCultureMatch.RESULT_COMPLETED_NOTICE);
         summary.failed = count(ruleId, NoCultureMatch.RESULT_FAILED);
+        summary.spatialFailed = count(ruleId, NoCultureMatch.RESULT_SPATIAL_FAILED);
         return summary;
     }
 
@@ -547,6 +608,7 @@ public class NoCultureRuleService {
         int frozen;
         int completedNotice;
         int failed;
+        int spatialFailed;
         int existed;
         int released;
         int skippedStillBound;

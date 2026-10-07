@@ -16,6 +16,8 @@ public class NoCultureMatch extends BaseEntity {
     public static final String RESULT_FROZEN = "FROZEN";
     public static final String RESULT_COMPLETED_NOTICE = "COMPLETED_NOTICE";
     public static final String RESULT_FAILED = "FAILED";
+    /** 空间边界判定本身异常（无法确认是否命中）：不能静默当不命中，留痕待人工核实/补冻。 */
+    public static final String RESULT_SPATIAL_FAILED = "SPATIAL_FAILED";
 
     private Long ruleId;
     private Long batchId;
